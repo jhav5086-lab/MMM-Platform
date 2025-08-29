@@ -16,20 +16,22 @@ from datetime import datetime
 import warnings
 warnings.filterwarnings('ignore')
 
-# Add other necessary imports
+# ML imports
 from sklearn.model_selection import train_test_split, GridSearchCV
 from sklearn.linear_model import ElasticNet, Lasso, Ridge
 from sklearn.metrics import mean_squared_error, r2_score
 from sklearn.preprocessing import StandardScaler
+
 import statsmodels.api as sm
 from scipy.optimize import minimize
 import json
 
-# Set page config
+# ---------------- PAGE CONFIG ---------------- #
 st.set_page_config(page_title="Marketing Mix Model", layout="wide")
 
+# ---------------- MAIN ---------------- #
 def main():
-    st.title("Marketing Mix Modeling Platform")
+    st.title("📊 Marketing Mix Modeling Platform")
     st.sidebar.title("Navigation")
 
     # Initialize session state
@@ -39,6 +41,10 @@ def main():
         st.session_state.model = None
     if 'results' not in st.session_state:
         st.session_state.results = None
+    if 'date_col' not in st.session_state:
+        st.session_state.date_col = None
+    if 'target_var' not in st.session_state:
+        st.session_state.target_var = None
 
     # Navigation
     pages = {
@@ -55,19 +61,18 @@ def main():
 
 # ---------------- Data Upload ---------------- #
 def data_upload():
-    st.header("Data Upload & Preprocessing")
+    st.header("📂 Data Upload & Preprocessing")
 
     uploaded_file = st.file_uploader("Upload your CSV file", type=["csv"])
 
     if uploaded_file is not None:
         try:
-            # Read data with Indian number format handling
             df = pd.read_csv(uploaded_file, thousands=',', na_values=['-', 'NA', ''])
 
             # Convert date column
             date_col = st.selectbox("Select date column", df.columns)
             if date_col:
-                df[date_col] = pd.to_datetime(df[date_col], format='%d-%m-%Y %H:%M', errors='coerce')
+                df[date_col] = pd.to_datetime(df[date_col], errors='coerce')
                 df = df.sort_values(date_col).reset_index(drop=True)
 
             # Identify target variable
@@ -78,12 +83,11 @@ def data_upload():
             st.session_state.date_col = date_col
             st.session_state.target_var = target_var
 
-            st.success("Data uploaded successfully!")
+            st.success("✅ Data uploaded successfully!")
 
-            # Check for data imbalance
             check_data_imbalance(df, target_var)
 
-            # Display basic info
+            # Preview
             st.subheader("Data Preview")
             st.dataframe(df.head())
 
@@ -100,30 +104,180 @@ def data_upload():
             st.error(f"Error reading file: {str(e)}")
 
 def check_data_imbalance(df, target_var):
-    """Check for data imbalance and suggest solutions"""
     missing_vals = df.isnull().sum()
     if missing_vals.sum() > 0:
-        st.warning(f"Data has {missing_vals.sum()} missing values. Consider imputation.")
+        st.warning(f"⚠️ Data has {missing_vals.sum()} missing values. Consider imputation.")
         if st.button("Show missing values details"):
             st.write(missing_vals[missing_vals > 0])
 
     constant_cols = [col for col in df.columns if df[col].nunique() <= 1]
     if constant_cols:
-        st.warning(f"Constant columns detected: {constant_cols}. Consider removing them.")
+        st.warning(f"⚠️ Constant columns detected: {constant_cols}")
 
     Q1 = df[target_var].quantile(0.25)
     Q3 = df[target_var].quantile(0.75)
     IQR = Q3 - Q1
     outliers = ((df[target_var] < (Q1 - 1.5 * IQR)) | (df[target_var] > (Q3 + 1.5 * IQR))).sum()
     if outliers > 0:
-        st.warning(f"Potential outliers detected in target variable: {outliers} values")
+        st.warning(f"⚠️ Potential outliers in target variable: {outliers} values")
 
 # ---------------- EDA ---------------- #
 def eda_analysis():
-    ...
-    # (all your EDA, feature_engineering, model_training, results_interpreter,
-    # and optimization functions remain unchanged from what you shared)
-    ...
+    st.header("📈 Exploratory Data Analysis (EDA)")
 
+    if st.session_state.data is None:
+        st.warning("Please upload data first.")
+        return
+
+    df = st.session_state.data
+    target = st.session_state.target_var
+
+    st.subheader("Summary Statistics")
+    st.write(df.describe())
+
+    st.subheader("Correlation Heatmap")
+    corr = df.corr(numeric_only=True)
+    fig, ax = plt.subplots(figsize=(10, 6))
+    sns.heatmap(corr, annot=True, cmap="coolwarm", ax=ax)
+    st.pyplot(fig)
+
+    st.subheader("Target Variable Trend")
+    fig, ax = plt.subplots()
+    ax.plot(df[st.session_state.date_col], df[target])
+    ax.set_xlabel("Date")
+    ax.set_ylabel(target)
+    st.pyplot(fig)
+
+# ---------------- Feature Engineering ---------------- #
+def feature_engineering():
+    st.header("🔧 Feature Engineering")
+
+    if st.session_state.data is None:
+        st.warning("Please upload data first.")
+        return
+
+    df = st.session_state.data.copy()
+
+    st.subheader("Data Preview")
+    st.dataframe(df.head())
+
+    st.markdown("### Select transformations to apply:")
+
+    # Adstock Transformation
+    if st.checkbox("Apply Adstock Transformation"):
+        var = st.selectbox("Select variable for Adstock", df.columns)
+        hl = st.slider("Half-life (weeks)", 1, 12, 2)
+        df[f"{var}_adstock"] = apply_adstock(df[var], hl)
+        st.success(f"Applied Adstock on {var}")
+
+    # Saturation Transformation
+    if st.checkbox("Apply Saturation Transformation"):
+        var = st.selectbox("Select variable for Saturation", df.columns)
+        alpha = st.slider("Alpha", 0.1, 1.0, 0.5)
+        gamma = st.slider("Gamma", 0.1, 2.0, 1.0)
+        df[f"{var}_sat"] = apply_saturation(df[var], alpha, gamma)
+        st.success(f"Applied Saturation on {var}")
+
+    # Seasonality Dummies
+    if st.checkbox("Create Time-based Dummies"):
+        date_col = st.session_state.date_col
+        df["month"] = df[date_col].dt.month
+        df["week"] = df[date_col].dt.isocalendar().week
+        st.success("Created month and week dummy variables")
+
+    st.subheader("Transformed Data Preview")
+    st.dataframe(df.head())
+
+    # Save transformed data
+    st.session_state.data = df
+
+    st.download_button(
+        label="Download Transformed Data",
+        data=df.to_csv(index=False).encode("utf-8"),
+        file_name="features_transformed.csv",
+        mime="text/csv"
+    )
+
+def apply_adstock(series, half_life):
+    decay = 0.5 ** (1 / half_life)
+    result = []
+    prev = 0
+    for val in series:
+        prev = val + decay * prev
+        result.append(prev)
+    return np.array(result)
+
+def apply_saturation(series, alpha, gamma):
+    series = np.array(series)
+    return alpha * (series ** gamma) / (series ** gamma + 1)
+
+# ---------------- Model Training ---------------- #
+def model_training():
+    st.header("🤖 Model Training")
+
+    if st.session_state.data is None:
+        st.warning("Please upload & preprocess data first.")
+        return
+
+    df = st.session_state.data
+    target = st.session_state.target_var
+
+    features = [col for col in df.columns if col not in [target, st.session_state.date_col]]
+    X = df[features].fillna(0)
+    y = df[target]
+
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+
+    model_type = st.selectbox("Choose model", ["Ridge", "Lasso", "ElasticNet"])
+
+    if st.button("Train Model"):
+        if model_type == "Ridge":
+            model = Ridge()
+        elif model_type == "Lasso":
+            model = Lasso()
+        else:
+            model = ElasticNet()
+
+        model.fit(X_train, y_train)
+        y_pred = model.predict(X_test)
+
+        r2 = r2_score(y_test, y_pred)
+        rmse = np.sqrt(mean_squared_error(y_test, y_pred))
+
+        st.session_state.model = model
+        st.session_state.results = {"r2": r2, "rmse": rmse, "features": features}
+
+        st.success(f"✅ Model trained! R² = {r2:.3f}, RMSE = {rmse:.3f}")
+
+# ---------------- Results ---------------- #
+def results_interpreter():
+    st.header("📊 Results & Interpretation")
+
+    if st.session_state.results is None:
+        st.warning("Please train a model first.")
+        return
+
+    results = st.session_state.results
+    st.write("R²:", results["r2"])
+    st.write("RMSE:", results["rmse"])
+
+    coefs = st.session_state.model.coef_
+    feature_importance = pd.DataFrame({"Feature": results["features"], "Coefficient": coefs})
+    feature_importance = feature_importance.sort_values(by="Coefficient", ascending=False)
+
+    st.subheader("Feature Importance")
+    st.bar_chart(feature_importance.set_index("Feature"))
+
+# ---------------- Optimization ---------------- #
+def optimization():
+    st.header("📈 Optimization & Scenario Planning")
+
+    if st.session_state.model is None:
+        st.warning("Please train a model first.")
+        return
+
+    st.write("Future scenario planning will be implemented here (budget allocation, simulations).")
+
+# ---------------- Run ---------------- #
 if __name__ == "__main__":
     main()
