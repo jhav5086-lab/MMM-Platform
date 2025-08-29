@@ -16,22 +16,42 @@ from datetime import datetime
 import warnings
 warnings.filterwarnings('ignore')
 
-# ML imports
+# Add other necessary imports
 from sklearn.model_selection import train_test_split, GridSearchCV
 from sklearn.linear_model import ElasticNet, Lasso, Ridge
 from sklearn.metrics import mean_squared_error, r2_score
 from sklearn.preprocessing import StandardScaler
-
-import statsmodels.api as sm
 from scipy.optimize import minimize
-import json
 
-# ---------------- PAGE CONFIG ---------------- #
+# Set page config
 st.set_page_config(page_title="Marketing Mix Model", layout="wide")
 
-# ---------------- MAIN ---------------- #
+# ---------------------- UTILITY FUNCTIONS ---------------------- #
+def convert_indian_number_format(value):
+    """Convert Indian number format string to float"""
+    if isinstance(value, str):
+        # Remove commas and convert to float
+        value = value.replace(',', '')
+    try:
+        return float(value)
+    except:
+        return value
+
+def apply_adstock(series, decay_rate):
+    """Apply adstock transformation with decay rate"""
+    adstocked = np.zeros_like(series)
+    adstocked[0] = series[0]
+    for i in range(1, len(series)):
+        adstocked[i] = series[i] + decay_rate * adstocked[i-1]
+    return adstocked
+
+def apply_saturation(series, half_saturation):
+    """Apply saturation transformation using Hill function"""
+    return series / (series + half_saturation)
+
+# ---------------------- MAIN APP ---------------------- #
 def main():
-    st.title("📊 Marketing Mix Modeling Platform")
+    st.title("Marketing Mix Modeling Platform")
     st.sidebar.title("Navigation")
 
     # Initialize session state
@@ -41,10 +61,8 @@ def main():
         st.session_state.model = None
     if 'results' not in st.session_state:
         st.session_state.results = None
-    if 'date_col' not in st.session_state:
-        st.session_state.date_col = None
-    if 'target_var' not in st.session_state:
-        st.session_state.target_var = None
+    if 'processed_data' not in st.session_state:
+        st.session_state.processed_data = None
 
     # Navigation
     pages = {
@@ -59,21 +77,37 @@ def main():
     page = st.sidebar.radio("Go to", list(pages.keys()))
     pages[page]()
 
-# ---------------- Data Upload ---------------- #
 def data_upload():
-    st.header("📂 Data Upload & Preprocessing")
+    st.header("Data Upload & Preprocessing")
 
     uploaded_file = st.file_uploader("Upload your CSV file", type=["csv"])
 
     if uploaded_file is not None:
         try:
-            df = pd.read_csv(uploaded_file, thousands=',', na_values=['-', 'NA', ''])
+            # Read the CSV file
+            df = pd.read_csv(uploaded_file)
 
-            # Convert date column
-            date_col = st.selectbox("Select date column", df.columns)
-            if date_col:
-                df[date_col] = pd.to_datetime(df[date_col], errors='coerce')
-                df = df.sort_values(date_col).reset_index(drop=True)
+            # Convert Indian number format to floats
+            for col in df.columns:
+                if df[col].dtype == object:
+                    try:
+                        df[col] = df[col].apply(convert_indian_number_format)
+                    except:
+                        pass
+
+            # Identify date column
+            date_cols = [col for col in df.columns if any(term in col.lower() for term in ['date', 'time', 'week'])]
+            if date_cols:
+                date_col = st.selectbox("Select date column", date_cols)
+                try:
+                    df[date_col] = pd.to_datetime(df[date_col], errors='coerce')
+                    df = df.sort_values(date_col).reset_index(drop=True)
+                except:
+                    st.warning("Could not parse date column. Proceeding without date processing.")
+                    date_col = None
+            else:
+                date_col = None
+                st.warning("No date column found. Proceeding without date processing.")
 
             # Identify target variable
             target_var = st.selectbox("Select target variable (sales)", df.columns)
@@ -83,11 +117,12 @@ def data_upload():
             st.session_state.date_col = date_col
             st.session_state.target_var = target_var
 
-            st.success("✅ Data uploaded successfully!")
+            st.success("Data uploaded successfully!")
 
+            # Check for data imbalance
             check_data_imbalance(df, target_var)
 
-            # Preview
+            # Display basic info
             st.subheader("Data Preview")
             st.dataframe(df.head())
 
@@ -95,7 +130,8 @@ def data_upload():
             col1, col2 = st.columns(2)
             with col1:
                 st.write("Shape:", df.shape)
-                st.write("Date Range:", df[date_col].min(), "to", df[date_col].max())
+                if date_col:
+                    st.write("Date Range:", df[date_col].min(), "to", df[date_col].max())
             with col2:
                 st.write("Columns:", list(df.columns))
                 st.write("Missing Values:", df.isnull().sum().sum())
@@ -104,180 +140,513 @@ def data_upload():
             st.error(f"Error reading file: {str(e)}")
 
 def check_data_imbalance(df, target_var):
+    """Check for data imbalance and suggest solutions"""
+    # Check for missing values
     missing_vals = df.isnull().sum()
     if missing_vals.sum() > 0:
-        st.warning(f"⚠️ Data has {missing_vals.sum()} missing values. Consider imputation.")
+        st.warning(f"Data has {missing_vals.sum()} missing values. Consider imputation.")
         if st.button("Show missing values details"):
             st.write(missing_vals[missing_vals > 0])
 
+    # Check for constant columns
     constant_cols = [col for col in df.columns if df[col].nunique() <= 1]
     if constant_cols:
-        st.warning(f"⚠️ Constant columns detected: {constant_cols}")
+        st.warning(f"Constant columns detected: {constant_cols}. Consider removing them.")
 
+    # Check for outliers in target variable
     Q1 = df[target_var].quantile(0.25)
     Q3 = df[target_var].quantile(0.75)
     IQR = Q3 - Q1
     outliers = ((df[target_var] < (Q1 - 1.5 * IQR)) | (df[target_var] > (Q3 + 1.5 * IQR))).sum()
     if outliers > 0:
-        st.warning(f"⚠️ Potential outliers in target variable: {outliers} values")
+        st.warning(f"Potential outliers detected in target variable: {outliers} values")
 
-# ---------------- EDA ---------------- #
 def eda_analysis():
-    st.header("📈 Exploratory Data Analysis (EDA)")
+    st.header("Exploratory Data Analysis")
 
     if st.session_state.data is None:
-        st.warning("Please upload data first.")
+        st.warning("Please upload data first")
         return
 
     df = st.session_state.data
-    target = st.session_state.target_var
+    target_var = st.session_state.target_var
+    date_col = st.session_state.date_col
 
-    st.subheader("Summary Statistics")
-    st.write(df.describe())
+    # Select variables for analysis
+    numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+    selected_vars = st.multiselect("Select variables for analysis", numeric_cols, default=[target_var])
 
-    st.subheader("Correlation Heatmap")
-    corr = df.corr(numeric_only=True)
-    fig, ax = plt.subplots(figsize=(10, 6))
-    sns.heatmap(corr, annot=True, cmap="coolwarm", ax=ax)
-    st.pyplot(fig)
+    if selected_vars:
+        # Time series plot
+        if date_col:
+            st.subheader("Time Series Analysis")
+            fig, ax = plt.subplots(figsize=(12, 6))
+            for var in selected_vars:
+                ax.plot(df[date_col], df[var], label=var)
+            ax.set_xlabel("Date")
+            ax.set_ylabel("Value")
+            ax.legend()
+            ax.tick_params(axis='x', rotation=45)
+            st.pyplot(fig)
+        else:
+            st.warning("No date column available for time series analysis")
 
-    st.subheader("Target Variable Trend")
-    fig, ax = plt.subplots()
-    ax.plot(df[st.session_state.date_col], df[target])
-    ax.set_xlabel("Date")
-    ax.set_ylabel(target)
-    st.pyplot(fig)
+        # Correlation matrix
+        st.subheader("Correlation Matrix")
+        corr_matrix = df[selected_vars].corr()
+        fig, ax = plt.subplots(figsize=(10, 8))
+        sns.heatmap(corr_matrix, annot=True, cmap='coolwarm', center=0, ax=ax)
+        st.pyplot(fig)
 
-# ---------------- Feature Engineering ---------------- #
+        # Distribution plots
+        st.subheader("Distribution of Variables")
+        for var in selected_vars:
+            fig, ax = plt.subplots(figsize=(8, 4))
+            sns.histplot(df[var], kde=True, ax=ax)
+            ax.set_title(f"Distribution of {var}")
+            st.pyplot(fig)
+
 def feature_engineering():
-    st.header("🔧 Feature Engineering")
+    st.header("Feature Engineering")
 
     if st.session_state.data is None:
-        st.warning("Please upload data first.")
+        st.warning("Please upload data first")
         return
 
     df = st.session_state.data.copy()
+    date_col = st.session_state.date_col
 
-    st.subheader("Data Preview")
+    st.subheader("Date-Based Features")
+    if date_col:
+        # Extract date components
+        df['year'] = df[date_col].dt.year
+        df['month'] = df[date_col].dt.month
+        df['week'] = df[date_col].dt.isocalendar().week
+        df['quarter'] = df[date_col].dt.quarter
+
+        # Create holiday dummies
+        st.write("### Add Holiday Dummies")
+        holiday_dates = st.text_area("Enter holiday dates (YYYY-MM-DD, one per line)")
+
+        if holiday_dates:
+            holidays = []
+            for date_str in holiday_dates.split('\n'):
+                if date_str.strip():
+                    try:
+                        holiday_date = datetime.strptime(date_str.strip(), '%Y-%m-%d')
+                        holidays.append(holiday_date)
+                    except ValueError:
+                        st.warning(f"Could not parse date: {date_str}")
+
+            if holidays:
+                df['holiday'] = df[date_col].isin(holidays).astype(int)
+                st.success(f"Added {len(holidays)} holiday dummies")
+    else:
+        st.warning("No date column available for creating date-based features")
+
+    st.subheader("Media Transformation Options")
+
+    # Select media variables
+    numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+    media_vars = st.multiselect("Select media variables", numeric_cols)
+
+    if media_vars:
+        col1, col2 = st.columns(2)
+
+        with col1:
+            st.write("### Adstock Parameters")
+            adstock_decay = {}
+            for var in media_vars:
+                adstock_decay[var] = st.slider(f"Adstock decay for {var}", 0.0, 1.0, 0.5, 0.05)
+
+        with col2:
+            st.write("### Saturation Parameters")
+            saturation_params = {}
+            for var in media_vars:
+                saturation_params[var] = st.slider(f"Saturation point for {var}",
+                                                  float(df[var].min()),
+                                                  float(df[var].max()),
+                                                  float(df[var].median()))
+
+        # Apply transformations
+        for var in media_vars:
+            df[f"{var}_adstock"] = apply_adstock(df[var], adstock_decay[var])
+            df[f"{var}_saturated"] = apply_saturation(df[f"{var}_adstock"], saturation_params[var])
+
+        st.success("Media transformations applied!")
+
+    st.subheader("Super Campaigns")
+    create_super_campaigns = st.checkbox("Create super campaigns")
+
+    if create_super_campaigns:
+        campaign_name = st.text_input("Super campaign name")
+        selected_media = st.multiselect("Select media for super campaign", numeric_cols)
+
+        if campaign_name and selected_media:
+            df[f"super_{campaign_name}"] = df[selected_media].sum(axis=1)
+            st.success(f"Created super campaign: {campaign_name}")
+
+    st.subheader("Variable Splitting")
+    split_var = st.selectbox("Select variable to split", [None] + numeric_cols)
+
+    if split_var:
+        split_value = st.slider("Split threshold", float(df[split_var].min()),
+                               float(df[split_var].max()), float(df[split_var].median()))
+        df[f"{split_var}_low"] = (df[split_var] <= split_value).astype(int)
+        df[f"{split_var}_high"] = (df[split_var] > split_value).astype(int)
+        st.success(f"Split {split_var} at value {split_value}")
+
+    # Update session state
+    st.session_state.processed_data = df
+
+    st.subheader("Processed Data Preview")
     st.dataframe(df.head())
 
-    st.markdown("### Select transformations to apply:")
-
-    # Adstock Transformation
-    if st.checkbox("Apply Adstock Transformation"):
-        var = st.selectbox("Select variable for Adstock", df.columns)
-        hl = st.slider("Half-life (weeks)", 1, 12, 2)
-        df[f"{var}_adstock"] = apply_adstock(df[var], hl)
-        st.success(f"Applied Adstock on {var}")
-
-    # Saturation Transformation
-    if st.checkbox("Apply Saturation Transformation"):
-        var = st.selectbox("Select variable for Saturation", df.columns)
-        alpha = st.slider("Alpha", 0.1, 1.0, 0.5)
-        gamma = st.slider("Gamma", 0.1, 2.0, 1.0)
-        df[f"{var}_sat"] = apply_saturation(df[var], alpha, gamma)
-        st.success(f"Applied Saturation on {var}")
-
-    # Seasonality Dummies
-    if st.checkbox("Create Time-based Dummies"):
-        date_col = st.session_state.date_col
-        df["month"] = df[date_col].dt.month
-        df["week"] = df[date_col].dt.isocalendar().week
-        st.success("Created month and week dummy variables")
-
-    st.subheader("Transformed Data Preview")
-    st.dataframe(df.head())
-
-    # Save transformed data
-    st.session_state.data = df
-
+    # Download button for processed data
+    csv = df.to_csv(index=False)
     st.download_button(
-        label="Download Transformed Data",
-        data=df.to_csv(index=False).encode("utf-8"),
-        file_name="features_transformed.csv",
-        mime="text/csv"
+        label="Download processed data as CSV",
+        data=csv,
+        file_name="processed_mmm_data.csv",
+        mime="text/csv",
     )
 
-def apply_adstock(series, half_life):
-    decay = 0.5 ** (1 / half_life)
-    result = []
-    prev = 0
-    for val in series:
-        prev = val + decay * prev
-        result.append(prev)
-    return np.array(result)
-
-def apply_saturation(series, alpha, gamma):
-    series = np.array(series)
-    return alpha * (series ** gamma) / (series ** gamma + 1)
-
-# ---------------- Model Training ---------------- #
 def model_training():
-    st.header("🤖 Model Training")
+    st.header("Model Training")
 
-    if st.session_state.data is None:
-        st.warning("Please upload & preprocess data first.")
+    if 'processed_data' not in st.session_state:
+        st.warning("Please process data in Feature Engineering first")
         return
 
-    df = st.session_state.data
-    target = st.session_state.target_var
+    df = st.session_state.processed_data
+    target_var = st.session_state.target_var
 
-    features = [col for col in df.columns if col not in [target, st.session_state.date_col]]
-    X = df[features].fillna(0)
-    y = df[target]
+    # Select features
+    all_features = [col for col in df.columns if col != target_var and not pd.api.types.is_datetime64_any_dtype(df[col])]
+    selected_features = st.multiselect("Select features for model", all_features, default=all_features)
 
-    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+    if not selected_features:
+        st.warning("Please select at least one feature")
+        return
 
-    model_type = st.selectbox("Choose model", ["Ridge", "Lasso", "ElasticNet"])
+    # Prepare data
+    X = df[selected_features]
+    y = df[target_var]
 
-    if st.button("Train Model"):
-        if model_type == "Ridge":
-            model = Ridge()
-        elif model_type == "Lasso":
-            model = Lasso()
-        else:
-            model = ElasticNet()
+    # Handle missing values
+    if X.isnull().sum().sum() > 0:
+        st.warning("Data contains missing values. Using mean imputation.")
+        X = X.fillna(X.mean())
+        y = y.fillna(y.mean())
 
-        model.fit(X_train, y_train)
-        y_pred = model.predict(X_test)
+    # Train-test split
+    test_size = st.slider("Test set size", 0.1, 0.5, 0.2, 0.05)
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=test_size, shuffle=False)
 
-        r2 = r2_score(y_test, y_pred)
-        rmse = np.sqrt(mean_squared_error(y_test, y_pred))
+    # Scale features
+    scaler = StandardScaler()
+    X_train_scaled = scaler.fit_transform(X_train)
+    X_test_scaled = scaler.transform(X_test)
 
-        st.session_state.model = model
-        st.session_state.results = {"r2": r2, "rmse": rmse, "features": features}
+    # Model selection
+    model_type = st.selectbox("Select model type", ["ElasticNet", "Lasso", "Ridge"])
 
-        st.success(f"✅ Model trained! R² = {r2:.3f}, RMSE = {rmse:.3f}")
+    # Hyperparameter tuning
+    if model_type == "ElasticNet":
+        param_grid = {
+            'alpha': [0.001, 0.01, 0.1, 1.0, 10.0],
+            'l1_ratio': [0.1, 0.3, 0.5, 0.7, 0.9]
+        }
+        model = ElasticNet()
+    elif model_type == "Lasso":
+        param_grid = {'alpha': [0.001, 0.01, 0.1, 1.0, 10.0]}
+        model = Lasso()
+    else:  # Ridge
+        param_grid = {'alpha': [0.001, 0.01, 0.1, 1.0, 10.0]}
+        model = Ridge()
 
-# ---------------- Results ---------------- #
+    # Grid search
+    with st.spinner("Running grid search for best parameters..."):
+        grid_search = GridSearchCV(model, param_grid, cv=5, scoring='neg_mean_squared_error')
+        grid_search.fit(X_train_scaled, y_train)
+
+    # Best model
+    best_model = grid_search.best_estimator_
+    st.session_state.model = best_model
+    st.session_state.scaler = scaler
+    st.session_state.features = selected_features
+    st.session_state.X_train = X_train
+    st.session_state.X_test = X_test
+    st.session_state.y_train = y_train
+    st.session_state.y_test = y_test
+
+    # Evaluate model
+    y_pred = best_model.predict(X_test_scaled)
+    mse = mean_squared_error(y_test, y_pred)
+    rmse = np.sqrt(mse)
+    r2 = r2_score(y_test, y_pred)
+
+    st.subheader("Model Performance")
+    col1, col2, col3 = st.columns(3)
+    col1.metric("Best Parameters", str(grid_search.best_params_))
+    col2.metric("RMSE", f"{rmse:.2f}")
+    col3.metric("R²", f"{r2:.4f}")
+
+    # Plot predictions vs actual
+    fig, ax = plt.subplots(figsize=(10, 6))
+    ax.plot(y_test.values, label='Actual')
+    ax.plot(y_pred, label='Predicted')
+    ax.set_xlabel("Time")
+    ax.set_ylabel(target_var)
+    ax.legend()
+    ax.set_title("Actual vs Predicted Values")
+    st.pyplot(fig)
+
+    # Feature importance
+    if hasattr(best_model, 'coef_'):
+        importance = pd.DataFrame({
+            'feature': selected_features,
+            'coefficient': best_model.coef_,
+            'abs_coefficient': np.abs(best_model.coef_)
+        }).sort_values('abs_coefficient', ascending=False)
+
+        st.subheader("Feature Importance")
+        fig, ax = plt.subplots(figsize=(10, 8))
+        colors = ['red' if x < 0 else 'green' for x in importance['coefficient']]
+        ax.barh(importance['feature'], importance['coefficient'], color=colors)
+        ax.set_xlabel("Coefficient Value")
+        ax.set_title("Feature Impact on Sales")
+        st.pyplot(fig)
+
 def results_interpreter():
-    st.header("📊 Results & Interpretation")
-
-    if st.session_state.results is None:
-        st.warning("Please train a model first.")
-        return
-
-    results = st.session_state.results
-    st.write("R²:", results["r2"])
-    st.write("RMSE:", results["rmse"])
-
-    coefs = st.session_state.model.coef_
-    feature_importance = pd.DataFrame({"Feature": results["features"], "Coefficient": coefs})
-    feature_importance = feature_importance.sort_values(by="Coefficient", ascending=False)
-
-    st.subheader("Feature Importance")
-    st.bar_chart(feature_importance.set_index("Feature"))
-
-# ---------------- Optimization ---------------- #
-def optimization():
-    st.header("📈 Optimization & Scenario Planning")
+    st.header("Results Interpretation")
 
     if st.session_state.model is None:
-        st.warning("Please train a model first.")
+        st.warning("Please train a model first")
         return
 
-    st.write("Future scenario planning will be implemented here (budget allocation, simulations).")
+    model = st.session_state.model
+    df = st.session_state.processed_data
+    features = st.session_state.features
+    target_var = st.session_state.target_var
+    date_col = st.session_state.date_col
 
-# ---------------- Run ---------------- #
+    # Calculate contributions
+    X = df[features]
+    X_scaled = st.session_state.scaler.transform(X)
+
+    if hasattr(model, 'coef_'):
+        contributions = X_scaled * model.coef_
+        contributions_df = pd.DataFrame(contributions, columns=[f"contribution_{f}" for f in features])
+        contributions_df['base'] = model.intercept_ if hasattr(model, 'intercept_') else 0
+        contributions_df['total_predicted'] = contributions_df.sum(axis=1)
+        contributions_df[target_var] = df[target_var].values
+
+        if date_col:
+            contributions_df['date'] = df[date_col]
+
+        # Plot contributions over time
+        st.subheader("Sales Decomposition")
+
+        # Get top 5 contributors
+        contribution_cols = [f"contribution_{f}" for f in features]
+        top_contributors = contributions_df[contribution_cols].sum().sort_values(ascending=False).head(5).index.tolist()
+        other_contributors = [col for col in contribution_cols if col not in top_contributors]
+
+        # Sum other contributors
+        contributions_df['other'] = contributions_df[other_contributors].sum(axis=1)
+
+        fig, ax = plt.subplots(figsize=(12, 8))
+
+        if date_col:
+            dates = contributions_df['date']
+            stack_data = contributions_df[top_contributors + ['other']]
+
+            # Create stacked area chart
+            ax.stackplot(dates, stack_data.T, labels=[col.replace('contribution_', '') for col in top_contributors] + ['Other'], alpha=0.7)
+            ax.plot(dates, contributions_df['total_predicted'], label='Total Predicted', color='black', linewidth=2)
+            ax.plot(dates, contributions_df[target_var], label='Actual', color='red', linestyle='--', linewidth=2)
+            ax.set_xlabel("Date")
+        else:
+            # If no date column, use index
+            x = range(len(contributions_df))
+            stack_data = contributions_df[top_contributors + ['other']]
+
+            # Create stacked area chart
+            ax.stackplot(x, stack_data.T, labels=[col.replace('contribution_', '') for col in top_contributors] + ['Other'], alpha=0.7)
+            ax.plot(x, contributions_df['total_predicted'], label='Total Predicted', color='black', linewidth=2)
+            ax.plot(x, contributions_df[target_var], label='Actual', color='red', linestyle='--', linewidth=2)
+            ax.set_xlabel("Time Period")
+
+        ax.set_ylabel(target_var)
+        ax.legend(loc='upper left')
+        ax.set_title("Sales Decomposition by Channel")
+        st.pyplot(fig)
+
+        # ROI calculation (using coefficients as efficiency measures)
+        st.subheader("Channel Efficiency")
+        efficiency = pd.DataFrame({
+            'channel': features,
+            'efficiency': model.coef_,
+            'contribution': contributions_df[[f"contribution_{f}" for f in features]].sum().values
+        }).sort_values('efficiency', ascending=False)
+
+        # Create bubble chart similar to Nielsen presentation
+        fig, ax = plt.subplots(figsize=(10, 8))
+        scatter = ax.scatter(
+            efficiency['efficiency'],
+            efficiency['contribution'],
+            s=efficiency['contribution']/1000,  # Scale bubble size
+            alpha=0.6
+        )
+
+        # Add labels to some points
+        for i, row in efficiency.iterrows():
+            if abs(row['efficiency']) > efficiency['efficiency'].std() or row['contribution'] > efficiency['contribution'].quantile(0.75):
+                ax.annotate(row['channel'], (row['efficiency'], row['contribution']),
+                           xytext=(5, 5), textcoords='offset points')
+
+        ax.axvline(0, color='gray', linestyle='--')
+        ax.set_xlabel("Efficiency (Coefficient)")
+        ax.set_ylabel("Total Contribution")
+        ax.set_title("Channel Efficiency vs Contribution")
+        st.pyplot(fig)
+
+        st.dataframe(efficiency)
+
+def optimization():
+    st.header("Optimization & Scenario Planning")
+
+    if st.session_state.model is None:
+        st.warning("Please train a model first")
+        return
+
+    model = st.session_state.model
+    features = st.session_state.features
+    scaler = st.session_state.scaler
+    df = st.session_state.processed_data
+
+    st.subheader("Budget Optimization")
+
+    # Get current media spend (approximate)
+    media_vars = [f for f in features if any(x in f for x in ['impressions', 'clicks', 'spend', 'adstock', 'saturated'])]
+
+    if not media_vars:
+        st.warning("No media variables found for optimization")
+        return
+
+    current_spend = {}
+    for var in media_vars:
+        # Use mean value as proxy for current spend
+        current_spend[var] = st.number_input(f"Current spend for {var}",
+                                            value=float(df[var].mean()),
+                                            step=1000.0)
+
+    total_budget = st.number_input("Total marketing budget",
+                                  value=sum(current_spend.values()),
+                                  step=1000.0)
+
+    # Define optimization function
+    def objective(x):
+        # x is the allocation to each media channel
+        # Create a base scenario with mean values for non-media variables
+        base_values = np.zeros(len(features))
+        for i, f in enumerate(features):
+            if f in media_vars:
+                base_values[i] = x[media_vars.index(f)]
+            else:
+                base_values[i] = np.mean(df[f])
+
+        # Scale and predict
+        base_values_scaled = scaler.transform(base_values.reshape(1, -1))
+        return -model.predict(base_values_scaled)[0]  # Negative for minimization
+
+    # Constraints
+    constraints = (
+        {'type': 'eq', 'fun': lambda x: total_budget - sum(x)},  # Budget constraint
+    )
+
+    # Bounds (at least 10% of current spend, at most 200%)
+    bounds = [(current_spend[var] * 0.1, current_spend[var] * 2) for var in media_vars]
+
+    # Initial guess
+    x0 = [current_spend[var] for var in media_vars]
+
+    if st.button("Run Optimization"):
+        with st.spinner("Running optimization..."):
+            result = minimize(objective, x0, method='SLSQP', bounds=bounds, constraints=constraints)
+
+        if result.success:
+            optimized_allocation = result.x
+            current_sales = -objective([current_spend[var] for var in media_vars])
+            optimized_sales = -result.fun
+
+            st.subheader("Optimization Results")
+            col1, col2 = st.columns(2)
+
+            with col1:
+                st.metric("Current Sales", f"${current_sales:,.2f}")
+                st.metric("Optimized Sales", f"${optimized_sales:,.2f}")
+                st.metric("Improvement", f"${optimized_sales - current_sales:,.2f}",
+                         delta=f"{((optimized_sales - current_sales) / current_sales * 100):.1f}%")
+
+            with col2:
+                allocation_df = pd.DataFrame({
+                    'Channel': media_vars,
+                    'Current': [current_spend[var] for var in media_vars],
+                    'Optimized': optimized_allocation,
+                    'Change': optimized_allocation - [current_spend[var] for var in media_vars],
+                    'Change %': [(optimized_allocation[i] - current_spend[var]) / current_spend[var] * 100
+                                for i, var in enumerate(media_vars)]
+                })
+                st.dataframe(allocation_df)
+
+            # Plot allocation comparison
+            fig, ax = plt.subplots(figsize=(10, 6))
+            x = np.arange(len(media_vars))
+            width = 0.35
+            ax.bar(x - width/2, [current_spend[var] for var in media_vars], width, label='Current')
+            ax.bar(x + width/2, optimized_allocation, width, label='Optimized')
+            ax.set_xlabel('Channels')
+            ax.set_ylabel('Spend')
+            ax.set_title('Current vs Optimized Spend Allocation')
+            ax.set_xticks(x)
+            ax.set_xticklabels(media_vars, rotation=45)
+            ax.legend()
+            st.pyplot(fig)
+
+        else:
+            st.error("Optimization failed: " + result.message)
+
+    st.subheader("Scenario Planning")
+    scenario_name = st.text_input("Scenario name")
+
+    if scenario_name:
+        scenario_changes = {}
+        for var in media_vars:
+            change = st.slider(f"Change for {var} (%)", -100, 200, 0, 5)
+            scenario_changes[var] = change / 100
+
+        if st.button("Evaluate Scenario"):
+            # Calculate new values
+            new_values = {}
+            for var in media_vars:
+                new_values[var] = current_spend[var] * (1 + scenario_changes[var])
+
+            # Predict outcome
+            base_values = np.zeros(len(features))
+            for i, f in enumerate(features):
+                if f in media_vars:
+                    base_values[i] = new_values[f]
+                else:
+                    base_values[i] = np.mean(df[f])
+
+            base_values_scaled = scaler.transform(base_values.reshape(1, -1))
+            scenario_sales = model.predict(base_values_scaled)[0]
+            current_sales = -objective([current_spend[var] for var in media_vars])
+
+            st.metric("Scenario Sales", f"${scenario_sales:,.2f}",
+                     delta=f"${scenario_sales - current_sales:,.2f}")
+
 if __name__ == "__main__":
     main()
