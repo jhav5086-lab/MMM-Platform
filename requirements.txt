@@ -8,4 +8,3 @@ scipy>=1.10.0
 statsmodels>=0.13.0
 plotly
 IPython
-
